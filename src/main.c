@@ -43,6 +43,7 @@
 typedef struct client_t {
     int fd;
     int state;
+    char *request;
     struct bufferevent *buf_ev;
 } client_t;
 
@@ -52,6 +53,8 @@ typedef struct client_t {
 
 #define CLIENT_STATE_WAITING_REQUEST 0
 #define CLIENT_STATE_WAITING_REPLY   1
+
+#define MAX_REQUEST_SIZE 4096
 
 /* Globals */
 static int g_quitflag = 0;
@@ -166,173 +169,27 @@ static int drop_privs(char *user) {
  *
  * @param client placeholder with client request.
  */
-/* static void handle_request(client_t *client) { */
-/*     struct evbuffer *evb; */
+static void handle_request(client_t *client) {
+    struct evbuffer *evb;
 
-/*     assert(client); */
+    assert(client);
 
-/*     if(!client) */
-/*         return; */
+    if(!client)
+        return;
 
-/*     /\* we don't really care about read events any more, so we'll */
-/*      * disable those, but we'll keep the bufferevent around because */
-/*      * we'll eventually be pushing a write out to this fd. *\/ */
-/*     bufferevent_disable(client->buf_ev, EV_READ); */
+    /* we don't really care about read events any more, so we'll
+     * disable those, but we'll keep the bufferevent around because
+     * we'll eventually be pushing a write out to this fd. */
+    bufferevent_disable(client->buf_ev, EV_READ);
 
-/*     switch(client->request->cmd) { */
-/*     case CMD_LOOKUP_STATS: */
-/*         DEBUG("Setting up STATS response on fd %d", client->fd); */
-/*         stats = ldap_queue_stats(lookup_queue); */
-/*         wq_stats = work_queue_stats(lookup_queue); */
+    evb = evbuffer_new();
 
-/*         if((!stats) || (!wq_stats)) { */
-/*             ERROR("Can't retrieve ldap stats"); */
-/*             if(stats) */
-/*                 free(stats); */
-
-/*             if(wq_stats) */
-/*                 free(wq_stats); */
-
-/*             close_client(client); */
-/*             return; */
-/*         } */
-
-/*         kvpair = kv_pair_init(TRUE); */
-/*         if(!kvpair) { */
-/*             ERROR("Malloc error initializing kvpair"); */
-/*             free(stats); */
-/*             free(wq_stats); */
-/*             close_client(client); */
-/*             return; */
-/*         } */
-
-/*         if(!kv_pair_add_numeric(kvpair, FALSE, "queries", stats->queries) || */
-/*            !kv_pair_add_numeric(kvpair, FALSE, "cache_hits", stats->cache_hits) || */
-/*            !kv_pair_add_numeric(kvpair, FALSE, "cache_misses", stats->cache_misses) || */
-/*            !kv_pair_add_numeric(kvpair, FALSE, "successful_queries", stats->successful_queries) || */
-/*            !kv_pair_add_numeric(kvpair, FALSE, "failed_queries", stats->failed_queries) || */
-/*            !kv_pair_add_numeric(kvpair, FALSE, "ldap_errors", stats->ldap_errors) || */
-/*            !kv_pair_add_numeric(kvpair, FALSE, "memcache_errors", stats->memcache_errors) || */
-/*            !kv_pair_add_numeric(kvpair, FALSE, "total_workers", wq_stats->total_workers) || */
-/*            !kv_pair_add_numeric(kvpair, FALSE, "waiting_workers", wq_stats->waiting_workers) || */
-/*            !kv_pair_add_numeric(kvpair, FALSE, "busy_workers", wq_stats->busy_workers) || */
-/*            !kv_pair_add_numeric(kvpair, FALSE, "max_queued_items", wq_stats->max_queued_items)) { */
-/*             ERROR("Malloc error in kv_pair"); */
-/*             free(stats); */
-/*             free(wq_stats); */
-/*             close_client(client); */
-/*             return; */
-/*         } */
-
-/*         free(stats); */
-/*         free(wq_stats); */
-
-/*         evb = evbuffer_new(); */
-
-/*         if(!evb) { */
-/*             ERROR("Malloc error: can't allocate new evbuffer on fd %d", client->fd); */
-/*             close_client(client); */
-/*             return; */
-/*         } */
-
-/*         /\* figure out the size of the k/v pairs *\/ */
-/*         size = 0; */
-/*         kv_pair_rewind(kvpair); */
-
-/*         while(kv_pair_next(kvpair, &key, &value)) { */
-/*             size += strlen(key) + strlen(value) + 2; */
-/*         } */
-
-/*         int total_size = sizeof(lookup_response_t) + size; */
-
-/*         response = (lookup_response_t *)calloc(1, total_size); */
-/*         if(!response) { */
-/*             ERROR("Malloc error: can't allocate response on fd %d", client->fd); */
-/*             close_client(client); */
-/*             return; */
-/*         } */
-
-/*         response->response_len = htons(total_size); */
-/*         response->response_code = 0; */
-/*         response->response_count = htons(kv_pair_count(kvpair)); */
-
-/*         kv_pair_rewind(kvpair); */
-/*         char *current = &response->response; */
-
-/*         while(kv_pair_next(kvpair, &key, &value)) { */
-/*             strcpy(current, key); */
-/*             current += strlen(key) + 1; */
-/*             strcpy(current, value); */
-/*             current += strlen(value) + 1; */
-/*         } */
-
-/*         evbuffer_add(evb, (void*)response, total_size); */
-
-/*         DEBUG("Queueing %d bytes for write on fd %d", ntohs(response->response_len), */
-/*               client->fd); */
-
-/*         /\* write low-water should already be zero *\/ */
-/*         bufferevent_enable(client->buf_ev, EV_WRITE); */
-/*         bufferevent_write_buffer(client->buf_ev, evb); */
-/*         evbuffer_free(evb); */
-/*         break; */
-
-/*     case CMD_LOOKUP_PING: */
-/*         DEBUG("Setting up PING response on fd %d", client->fd); */
-
-/*         evb = evbuffer_new(); */
-
-/*         if(!evb) { */
-/*             ERROR("Malloc error: can't allocate new evbuffer on fd %d", client->fd); */
-/*             close_client(client); */
-/*             return; */
-/*         } */
-
-/*         response = (lookup_response_t *)calloc(1, sizeof(lookup_response_t)); */
-/*         if(!response) { */
-/*             ERROR("Malloc error: can't allocate response on fd %d", client->fd); */
-/*             close_client(client); */
-/*             return; */
-/*         } */
-
-/*         response->response_len = htons(sizeof(lookup_response_t)); */
-/*         response->response = 0; */
-/*         response->response_count = 0; */
-
-/*         evbuffer_add(evb, (void*)response, sizeof(lookup_response_t)); */
-
-/*         DEBUG("Queueing %d bytes for write on fd %d", ntohs(response->response_len), */
-/*               client->fd); */
-
-/*         /\* write low-water should already be zero *\/ */
-/*         bufferevent_enable(client->buf_ev, EV_WRITE); */
-/*         bufferevent_write_buffer(client->buf_ev, evb); */
-/*         evbuffer_free(evb); */
-/*         break; */
-
-/*     case CMD_LOOKUP_DDI: */
-/*     case CMD_LOOKUP_SITE: */
-/*     case CMD_LOOKUP_SITEID: */
-/*         /\* all ldap queries are handled the same, essentially *\/ */
-/*         client->state = CLIENT_STATE_WAITING_LOOKUP; */
-
-/*         client->ldap_work_item = work_queue_enqueue(lookup_queue, (void*) client); */
-/*         if(!client->ldap_work_item) { */
-/*             /\* something very bad.  Might as well just kill the lcient *\/ */
-/*             close_client(client); */
-/*             break; */
-/*         } */
-
-/*         break; */
-/*     default: */
-/*         ERROR("Unhandled request type: %d on fd %d", client->request->cmd, */
-/*               client->fd); */
-/*         close_client(client); */
-/*         return; */
-/*         break; */
-/*     } */
-
-/* } */
+    if(!evb) {
+        ERROR("Malloc error: can't allocate new evbuffer on fd %d", client->fd);
+        close_client(client);
+        return;
+    }
+}
 
 
 /**
@@ -387,10 +244,10 @@ static void close_client(client_t *client) {
         client->buf_ev = NULL;
     }
 
-    /* if(client->request) { */
-    /*     free(client->request); */
-    /*     client->request = NULL; */
-    /* } */
+    if(client->request) {
+        free(client->request);
+        client->request = NULL;
+    }
 
     /* if(client->response) { */
     /*     free(client->response); */
@@ -440,10 +297,60 @@ static void on_buf_write(struct bufferevent *bev, void *arg) {
  */
 static void on_buf_read(struct bufferevent *bev, void *arg) {
     client_t *client = (client_t *)arg;
+    size_t buffer_left, bytes_read;
+    char *end;
 
-    DEBUG("Read event (state %d) on fd %d... aborting", client->state, client->fd);
+    assert(client);
+    assert(client->fd > 0);
+    assert(client->request);
 
-    close_client(client);
+    if((!client) || (!client->request) || (client->fd < 1)) {
+        ERROR("Bad client struct in on_buf_read");
+        close_client(client);
+        return;
+    }
+
+    DEBUG("Read event (state %d) on fd %d", client->state, client->fd);
+
+    buffer_left = MAX_REQUEST_SIZE - strlen(client->request);
+
+    if(buffer_left <= 0) {
+        ERROR("Out of request space on fd %d.  Aborting.", client->fd);
+        close_client(client);
+    }
+
+    bytes_read = bufferevent_read(client->buf_ev,
+                                  (void*)&client->request[strlen(client->request)],
+                                  buffer_left - 1);
+
+    if(bytes_read == -1) {
+        if (errno != EINTR) {
+            /* if EINTR, we'll just pick it back up on the next epoll */
+            ERROR("Read error on fd %d", client->fd);
+            close_client(client);
+        }
+
+        return;
+    }
+
+
+    DEBUG("Read %d bytes on fd %d", bytes_read, client->fd);
+
+    end = client->request;
+    while(*end && (*end != '\n') && (*end != '\r')) {
+        end++;
+    }
+
+    if(*end) {
+        *end = '\0';
+        client->state = CLIENT_STATE_WAITING_REPLY;
+        DEBUG("Got client request on fd %d: %s", client->fd, client->request);
+
+        /* hand this off to set up a response object */
+        handle_request(client);
+    } else {
+        DEBUG("Partial request read on fd %d", client->fd);
+    }
 }
 
 /**
@@ -519,6 +426,16 @@ static void on_accept(int fd, short event, void *arg) {
     client->buf_ev = bufferevent_new(client_fd, on_buf_read,
                                      on_buf_write, on_buf_error, (void*)client);
     client->state = CLIENT_STATE_WAITING_REQUEST;
+
+    client->request = (char*)calloc(1, MAX_REQUEST_SIZE);
+    if(!client->request) {
+        ERROR("Malloc error in on_accept");
+        shutdown(client_fd, SHUT_RDWR);
+        close(client_fd);
+        free(client);
+        return;
+    }
+
     bufferevent_enable(client->buf_ev, EV_READ);
 }
 
