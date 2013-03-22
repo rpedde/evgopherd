@@ -164,31 +164,74 @@ static int drop_privs(char *user) {
 /* } */
 
 /**
+ * Spin out an error item to the client
+ *
+ * @param client placeholder with client request
+ * @param text error message text
+ */
+static void handle_error(client_t *client, char *text) {
+    struct evbuffer *evb;
+    char *buffer;
+
+    assert(client);
+    assert(client->request);
+
+    if((!client) || (!client->request)) {
+        /* can't happen -- dispatcher catches this */
+        close_client(client);
+        return;
+    }
+
+    evb = evbuffer_new();
+
+    buffer = (char*)malloc(strlen(text) + 10);  /* "3%s\t\t\t\n\r.\n\r", text */
+    if(!buffer) {
+        ERROR("malloc error");
+        evbuffer_free(evb);
+        close_client(client);
+        return;
+    }
+
+    sprintf(buffer, "3%s\t\t\t\n\r.\n\r", text);
+    evbuffer_add(evb, (void*)buffer, strlen(buffer));
+
+    DEBUG("Queueing %d bytes for write on fd %d", strlen(buffer),
+          client->fd);
+
+    /* write low-water should already be zero */
+    bufferevent_enable(client->buf_ev, EV_WRITE);
+    bufferevent_write_buffer(client->buf_ev, evb);
+    evbuffer_free(evb);
+
+    return;
+}
+
+/**
  * We have a brand new request from a new client, so we'll
  * do the needful.
  *
  * @param client placeholder with client request.
  */
 static void handle_request(client_t *client) {
-    struct evbuffer *evb;
-
     assert(client);
+    assert(client->request);
 
     if(!client)
         return;
+
+    if(!client->request) {
+        ERROR("No client request on fd %d.  Aborting", client->fd);
+        close_client(client);
+    }
 
     /* we don't really care about read events any more, so we'll
      * disable those, but we'll keep the bufferevent around because
      * we'll eventually be pushing a write out to this fd. */
     bufferevent_disable(client->buf_ev, EV_READ);
 
-    evb = evbuffer_new();
-
-    if(!evb) {
-        ERROR("Malloc error: can't allocate new evbuffer on fd %d", client->fd);
-        close_client(client);
-        return;
-    }
+    /* figure out what handler type the request is for
+       and pass it through */
+    handle_error(client, "Oh noes!");
 }
 
 

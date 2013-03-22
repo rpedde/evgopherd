@@ -1,0 +1,5 @@
+
+This is not yet, but will someday be a massively scalable event-based
+gopher server designed to solve the c10k gopher problem.
+
+Gopher.  At web scale.  Tell your friends.
