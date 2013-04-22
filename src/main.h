@@ -28,6 +28,7 @@
 
 typedef struct gopher_conf_t {
     char *config_file;
+    char *unpriv_user;
     uint16_t port;
     char *base_dir;
     int debug_level;
@@ -35,7 +36,7 @@ typedef struct gopher_conf_t {
     int socket_backlog;
 } gopher_conf_t;
 
-extern struct lookup_config_t lookup_config;
+extern struct gopher_conf_t config;
 
 #define UNUSED(a) { (void)(a); };
 #define MAX(a,b) ((a) > (b)) ? (a) : (b)

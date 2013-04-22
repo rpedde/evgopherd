@@ -16,6 +16,7 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#include <dirent.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -28,7 +29,10 @@
 #include <assert.h>
 #include <pwd.h>
 #include <grp.h>
+#include <limits.h>
+#include <stddef.h>
 
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -39,20 +43,40 @@
 
 #include "main.h"
 #include "debug.h"
+#include "plugin.h"
 
-typedef struct client_t {
+
+#define MAX_FILE_BUFFER 1024
+
+
+/* it would be nice to have a loadable module system */
+typedef struct client_module_t {
+    char *handler_name;
+    void (*dispatch_fn)(void *state, char *resource);
+    void *(*alloc_fn)(void);
+    void (*dealloc_fn)(void *state);
+} client_module_t;
+
+typedef struct opaque_file_t {
     int fd;
-    int state;
-    char *request;
-    struct bufferevent *buf_ev;
-} client_t;
+    ssize_t bytes_in_buffer;
+    char *buffer;
+} opaque_file_t;
+
+typedef struct opaque_dir_t {
+    DIR *dir;
+    struct dirent *de;
+    char *line;
+} opaque_dir_t;
+
 
 /* Defines */
 #define DEFAULT_CONFIGFILE "/etc/evgopherd.conf"
 #define DEFAULT_DEBUGLEVEL 2
 
-#define CLIENT_STATE_WAITING_REQUEST 0
-#define CLIENT_STATE_WAITING_REPLY   1
+#define CLIENT_STATE_WAITING_REQUEST  0
+#define CLIENT_STATE_WAITING_REPLY    1
+#define CLIENT_STATE_SENDING_RESPONSE 2
 
 #define MAX_REQUEST_SIZE 4096
 
@@ -97,6 +121,35 @@ void usage_quit(char *name) {
     fprintf(stderr,"\n\n");
 
     exit(EXIT_FAILURE);
+}
+
+/**
+ * determine size of dirent struct, for readdir_r.
+ *
+ * Code borrowed from http://womble.decadent.org.uk/readdir_r-advisory.html
+ */
+size_t dirent_buf_size(DIR *dirp) {
+    long name_max;
+    size_t name_end;
+#   if defined(HAVE_FPATHCONF) && defined(HAVE_DIRFD)   \
+    && defined(_PC_NAME_MAX)
+    name_max = fpathconf(dirfd(dirp), _PC_NAME_MAX);
+    if (name_max == -1)
+#           if defined(NAME_MAX)
+        name_max = (NAME_MAX > 255) ? NAME_MAX : 255;
+#           else
+    return (size_t)(-1);
+#           endif
+#   else
+#       if defined(NAME_MAX)
+    name_max = (NAME_MAX > 255) ? NAME_MAX : 255;
+#       else
+#           error "buffer size for readdir_r cannot be determined"
+#       endif
+#   endif
+    name_end = (size_t)offsetof(struct dirent, d_name) + name_max + 1;
+    return (name_end > sizeof(struct dirent)
+            ? name_end : sizeof(struct dirent));
 }
 
 /**
@@ -164,14 +217,15 @@ static int drop_privs(char *user) {
 /* } */
 
 /**
- * Spin out an error item to the client
+ * Spin out an error item to the client.
  *
  * @param client placeholder with client request
  * @param text error message text
  */
-static void handle_error(client_t *client, char *text) {
+void handle_error(client_t *client, internal_type_t type, char *text) {
     struct evbuffer *evb;
     char *buffer;
+    char gopher_type;
 
     assert(client);
     assert(client->request);
@@ -180,6 +234,18 @@ static void handle_error(client_t *client, char *text) {
         /* can't happen -- dispatcher catches this */
         close_client(client);
         return;
+    }
+
+    switch(type) {
+    case TYPE_DIR:
+        gopher_type='i';
+        break;
+    case TYPE_FILE:
+        gopher_type='3';
+        break;
+    default:
+        gopher_type='i';
+        break;
     }
 
     evb = evbuffer_new();
@@ -192,7 +258,7 @@ static void handle_error(client_t *client, char *text) {
         return;
     }
 
-    sprintf(buffer, "3%s\t\t\t\n\r.\n\r", text);
+    sprintf(buffer, "%c%s\t\t\t\n\r.\n\r", gopher_type, text);
     evbuffer_add(evb, (void*)buffer, strlen(buffer));
 
     DEBUG("Queueing %d bytes for write on fd %d", strlen(buffer),
@@ -206,6 +272,52 @@ static void handle_error(client_t *client, char *text) {
     return;
 }
 
+
+/**
+ * given a string, event it up and poke out a bufferevent
+ */
+static void stream_string(struct bufferevent *buf_ev, char *str) {
+    struct evbuffer *evb;
+
+    evb = evbuffer_new();
+    if(!evb) {
+        ERROR("malloc");
+        return;
+    }
+
+    evbuffer_add(evb, str, strlen(str));
+    bufferevent_enable(buf_ev, EV_WRITE);
+    bufferevent_write_buffer(buf_ev, evb);
+    evbuffer_free(evb);
+}
+
+/**
+ * given a file, event up a chunk of data and throw it
+ * at the bufferevent
+ */
+static int stream_fd(int source_fd, struct bufferevent *buf_ev,
+                     char *buffer, ssize_t len) {
+    int bytes_read = 0;
+    struct evbuffer *evb;
+
+    evb = evbuffer_new();
+    if(!evb) {
+        ERROR("malloc");
+        return -1;
+    }
+
+    bytes_read = read(source_fd, buffer, len);
+    if(bytes_read < 1)
+        return bytes_read;
+
+    evbuffer_add(evb, buffer, bytes_read);
+    bufferevent_enable(buf_ev, EV_WRITE);
+    bufferevent_write_buffer(buf_ev, evb);
+    evbuffer_free(evb);
+
+    return bytes_read;
+}
+
 /**
  * We have a brand new request from a new client, so we'll
  * do the needful.
@@ -213,6 +325,8 @@ static void handle_error(client_t *client, char *text) {
  * @param client placeholder with client request.
  */
 static void handle_request(client_t *client) {
+    struct stat st;
+
     assert(client);
     assert(client->request);
 
@@ -231,7 +345,94 @@ static void handle_request(client_t *client) {
 
     /* figure out what handler type the request is for
        and pass it through */
-    handle_error(client, "Oh noes!");
+
+    if(strlen(client->request) == 0) {  /* empty request -- root */
+        free(client->request);
+        client->request = strdup("/");
+        if(!client->request) {
+            handle_error(client, TYPE_DIR, "Internal Error");
+        }
+    }
+
+    asprintf(&client->full_path, "%s/%s", config.base_dir, client->request);
+
+    /* stat this thing */
+    if(stat(client->full_path, &st) == -1) {
+        char *str_error = strerror(errno);
+        ERROR("Stat error: %s", str_error);
+        handle_error(client, TYPE_DIR, str_error);
+        return;
+    }
+
+    if(S_ISDIR(st.st_mode)) {
+        /* dir handler */
+        size_t size;
+        opaque_dir_t *od;
+
+        client->request_type = TYPE_DIR;
+        client->state = CLIENT_STATE_SENDING_RESPONSE;
+
+        od = (opaque_dir_t *)malloc(sizeof(opaque_dir_t));
+        if(!od) {
+            handle_error(client, TYPE_DIR, "malloc");
+            return;
+        }
+
+        memset((void*)od, 0, sizeof(opaque_dir_t));
+
+        client->opaque_client = od;
+
+        od->dir = opendir(client->full_path);
+        size = dirent_buf_size(od->dir);
+
+        if(size == -1) {
+            ERROR("Cannot determine size");
+            handle_error(client, TYPE_DIR, "no size");
+            return;
+        }
+
+        od->de = (struct dirent *)malloc(size);
+
+        bufferevent_enable(client->buf_ev, EV_WRITE);
+    } else if(S_ISREG(st.st_mode)) {
+        /* okay, so grab a block at a time, in 1k chunks,
+           throw them on the bufev */
+        opaque_file_t *of;
+        client->request_type = TYPE_FILE;
+        client->state = CLIENT_STATE_SENDING_RESPONSE;
+
+        of = (opaque_file_t *)malloc(sizeof(opaque_file_t));
+        if (!of) {
+            handle_error(client, TYPE_DIR, "Malloc");
+            return;
+        }
+
+        memset((void*)of, 0, sizeof(opaque_file_t));
+
+        client->opaque_client = of;
+        of->buffer = (char *)malloc(MAX_FILE_BUFFER);
+        if(!of->buffer) {
+            handle_error(client, TYPE_DIR, "Malloc");
+            return;
+        }
+
+        of->fd = open(client->full_path, O_RDONLY);
+        if(of->fd == -1) {
+            handle_error(client, TYPE_DIR, "open error");
+            return;
+        }
+
+        of->bytes_in_buffer = stream_fd(
+            of->fd, client->buf_ev, of->buffer, MAX_FILE_BUFFER);
+
+        if(of->bytes_in_buffer < 0) {
+            close_client(client);
+        }
+    } else {
+        /* some kind of strange file... should flag
+           on S_IFLNK */
+        handle_error(client, TYPE_DIR, "This is some kind of crazy file!");
+    }
 }
 
 
@@ -292,6 +493,54 @@ static void close_client(client_t *client) {
         client->request = NULL;
     }
 
+    if(client->full_path) {
+        free(client->full_path);
+        client->full_path = NULL;
+    }
+
+    /* this should probably best be handled
+     * by free functions in a pluggable handler,
+     * but for now, we'll special case them in the
+     * general cleanup.
+     */
+    switch(client->request_type) {
+    case TYPE_FILE:
+        if(client->opaque_client) {
+            opaque_file_t *of = (opaque_file_t*)(client->opaque_client);
+            if(of) {
+                if(of->buffer)
+                    free(of->buffer);
+
+                if(of->fd > 0) {
+                    close(of->fd);
+                }
+
+                free(of);
+                client->opaque_client = NULL;
+            }
+        }
+        break;
+
+    case TYPE_DIR: /* passthrough */
+        if(client->opaque_client) {
+            opaque_dir_t *od = (opaque_dir_t*)(client->opaque_client);
+            if(od) {
+                if(od->line) {
+                    free(od->line);
+                    od->line = NULL;
+                }
+
+                free(od);
+                client->opaque_client = NULL;
+            }
+        }
+        break;
+
+    case TYPE_UNKNOWN:
+    default: /* passthrough */
+        break;
+    }
+
     /* if(client->response) { */
     /*     free(client->response); */
     /*     client->response = NULL; */
@@ -330,6 +579,91 @@ static void on_buf_error(struct bufferevent *bev, short what, void *arg) {
 static void on_buf_write(struct bufferevent *bev, void *arg) {
     /* we finished our write.  We done. */
     client_t *client = (client_t *)arg;
+    opaque_file_t *of;
+    opaque_dir_t *od;
+    struct dirent *de;
+    int res;
+
+    assert(client);
+
+    if(!client) {
+        close_client(client);
+        return;
+    }
+
+    switch(client->state) {
+    case CLIENT_STATE_SENDING_RESPONSE:
+        switch(client->request_type) {
+        case TYPE_FILE:
+            of = (opaque_file_t *)client->opaque_client;
+
+            assert(of);
+            assert(of->buffer);
+
+            if((!of) || (!of->buffer)) {
+                close_client(client);
+                return;
+            }
+
+            if(of->bytes_in_buffer == 0)  /* done */
+                break;
+
+            of->bytes_in_buffer = stream_fd(
+                of->fd, client->buf_ev, of->buffer, MAX_FILE_BUFFER);
+
+            if(of->bytes_in_buffer < 0) {
+                ERROR("Read error on fd %d: %s", client->fd, strerror(errno));
+                close_client(client);
+                return;
+            }
+            break;
+        case TYPE_DIR:
+            od = (opaque_dir_t *)client->opaque_client;
+
+            assert(od);
+            assert(od->dir);
+
+            if((!od) || (!od->dir)) {
+                ERROR("Bad dir request on fd %d", client->fd);
+                break;
+            }
+
+            if(od->line) {
+                free(od->line);
+                od->line = NULL;
+            }
+
+            /* readdir_r here and jet out the links */
+            while(1) {
+                res = readdir_r(od->dir, od->de, &de);
+                if(res == -1) {
+                    ERROR("readdir_r error on fd %d", client->fd);
+                    break;
+                }
+
+                if(de == NULL)
+                    break;
+
+                if(od->de->d_name[0] == '.')
+                    continue;
+
+                asprintf(&(od->line), "0%s\t%s\tlocalhost\t70\n\r",
+                         od->de->d_name, od->de->d_name);
+
+                stream_string(client->buf_ev, od->line);
+                return;
+            }
+
+            closedir(od->dir);
+            /* fall through to close and log */
+            break;
+        default:
+            break;
+        }
+
+    default:
+        break;
+    }
 
     DEBUG("Finished write on fd %d", client->fd);
     close_client(client);

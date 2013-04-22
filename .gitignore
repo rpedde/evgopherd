@@ -17,3 +17,8 @@ stamp*
 #*
 *.o
 evgopherd
+ltmain.sh
+*.lo
+.libs
+*.la
+libtool
